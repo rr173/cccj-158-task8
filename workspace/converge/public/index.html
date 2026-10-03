@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>多站点变更汇合控制台</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171e2e; --panel2: #1d2638; --line: #2b3650;
+    --text: #e6ebf5; --muted: #8b97b0; --accent: #5b8cff; --ok: #3fb96b;
+    --warn: #e0a13c; --err: #e5484d; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  select, input, textarea, button { font: inherit; }
+  select, input[type=text], input[type=password], textarea {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px;
+  }
+  textarea { width: 100%; font-family: var(--mono); font-size: 12px; resize: vertical; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; cursor: pointer; }
+  button.ghost { background: transparent; border: 1px solid var(--line); color: var(--text); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  main { padding: 18px 20px; display: grid; grid-template-columns: 380px 1fr; gap: 16px; align-items: start; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 3px; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; }
+  .mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 11px; border: 1px solid var(--line); }
+  .tag.settled { color: var(--ok); border-color: var(--ok); }
+  .tag.conflict { color: var(--err); border-color: var(--err); }
+  .tag.suspended { color: var(--warn); border-color: var(--warn); }
+  .tag.pending { color: var(--muted); }
+  .tag.archived { color: #8f7bff; border-color: #8f7bff; }
+  .clickable { cursor: pointer; }
+  .clickable:hover { background: var(--panel2); }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--err); } .warn { color: var(--warn); }
+  pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 12px; overflow:auto; max-height: 360px; }
+  .candidate { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  .candidate label { display: flex; gap: 8px; align-items: flex-start; color: var(--text); margin: 4px 0; }
+  .toast { position: fixed; right: 18px; bottom: 18px; max-width: 460px; }
+  .toast div { background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: 12px; }
+  .toast .errbox { border-left-color: var(--err); }
+  .toast .okbox { border-left-color: var(--ok); }
+  svg.graph { width: 100%; height: 420px; background: var(--panel2); border-radius: 8px; }
+  .node-rect { fill: var(--panel); stroke: var(--line); }
+  .node-rect.change { stroke: var(--accent); }
+  .node-rect.merge { stroke: var(--ok); }
+  .node-rect.susp { stroke: var(--warn); stroke-dasharray: 4 3; }
+  .edge { stroke: #44547a; stroke-width: 1.5; fill: none; }
+  .edge.missing { stroke: var(--err); stroke-dasharray: 4 3; }
+  .edge.archived-edge { stroke: #8f7bff; stroke-dasharray: 2 3; opacity: .8; }
+  .node-rect.archived { stroke: #8f7bff; stroke-dasharray: 3 3; opacity: .9; }
+  .node-text { fill: var(--text); font-family: var(--mono); font-size: 10px; }
+  .node-sub { fill: var(--muted); font-family: var(--mono); font-size: 9px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .pill-role { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 99px; padding: 1px 9px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>多站点变更汇合</h1>
+  <span class="pill-role" id="rolepill">未认证</span>
+  <span class="spacer"></span>
+  <label style="margin:0; display:flex; align-items:center; gap:6px;">
+    操作员令牌
+    <select id="tokenSelect">
+      <option value="">— 选择身份 —</option>
+      <option value="operator-token">operator（上报 / 看图谱）</option>
+      <option value="reviewer1-token">reviewer-01（一审）</option>
+      <option value="reviewer2-token">reviewer-02（二审）</option>
+      <option value="inspector-token">inspector（只查脱敏收据）</option>
+      <option value="admin-token">admin（事件订阅管理）</option>
+    </select>
+  </label>
+  <input type="password" id="tokenInput" placeholder="或直接粘贴令牌" style="width:210px" />
+  <button class="ghost" id="refreshBtn">刷新</button>
+</header>
+
+<main>
+  <div>
+    <section class="panel" id="submitPanel" hidden>
+      <h2>上报信封</h2>
+      <div class="row">
+        <div><label>对象键 object_key</label><input type="text" id="f_object" placeholder="obj-1001" /></div>
+        <div><label>站点 site</label><input type="text" id="f_site" placeholder="station-alpha" /></div>
+        <div><label>站点单调序号 site_seq</label><input type="text" id="f_seq" value="1" /></div>
+      </div>
+      <label>覆盖区段 coverage_region</label><input type="text" id="f_region" placeholder="tiles:012:007" />
+      <label>变更摘要 change_digest（64 hex）</label>
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="f_change" style="flex:1; font-family:var(--mono)" placeholder="sha256 hex" />
+        <button class="ghost" type="button" id="genDigest">生成</button>
+      </div>
+      <label>前驱摘要 predecessor_digests（每行一个，可空）</label>
+      <textarea id="f_preds" rows="2" placeholder="（留空表示无前驱）"></textarea>
+      <label>请求键 request_key（同键同正文幂等）</label>
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="f_req" style="flex:1" placeholder="req-..." />
+        <button class="ghost" type="button" id="genReq">生成</button>
+      </div>
+      <div style="margin-top:12px; display:flex; gap:8px;">
+        <button id="submitBtn">提交</button>
+        <button class="ghost" type="button" id="previewDigest">预览节点摘要</button>
+      </div>
+      <pre id="submitResult" hidden></pre>
+    </section>
+
+    <section class="panel" id="casesPanel" hidden>
+      <h2>待判定冲突</h2>
+      <div id="casesList" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="receiptsPanel">
+      <h2>脱敏收据</h2>
+      <div class="row">
+        <input type="text" id="receiptFilter" placeholder="按对象键过滤（可空）" />
+        <button id="loadReceipts" class="ghost">查询</button>
+      </div>
+      <div style="margin-top:8px;">
+        <button class="ghost" id="verifyModeBtn" type="button">校验粘贴的收据</button>
+      </div>
+      <div id="receiptsList" style="margin-top:10px;"></div>
+      <pre id="receiptVerify" hidden></pre>
+    </section>
+  </div>
+
+  <div>
+    <section class="panel" id="listPanel">
+      <h2>对象与版本图</h2>
+      <table id="objectsTable">
+        <thead><tr><th>对象键</th><th>状态</th><th>当前回执</th><th>挂起</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p class="muted" id="objectsHint" hidden>监察员角色无图谱视图：请使用左侧收据查询。</p>
+    </section>
+
+    <section class="panel" id="archivePanel">
+      <h2>历史压缩与冷归档</h2>
+      <div id="archiveOps" class="row" style="margin-bottom:8px;">
+        <input type="text" id="cpObject" placeholder="对象键 object_key" />
+        <button id="cpBtn" type="button">创建检查点</button>
+        <button class="ghost" id="restoreBtn" type="button">恢复该对象</button>
+      </div>
+      <div id="archiveStatus" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="proofsPanel" hidden>
+      <h2>脱敏归档证明</h2>
+      <div id="proofsList" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="subsPanel" hidden>
+      <h2 id="subsTitle">下游事件订阅</h2>
+
+      <div id="subsAdminOps">
+        <div class="row">
+          <div><label>回调地址 callback_url</label><input type="text" id="subUrl" placeholder="https://compliance.example/hook" /></div>
+        </div>
+        <label>关注的状态变化（至少一项）</label>
+        <div id="subKinds" class="row" style="flex-wrap:wrap; gap:6px;">
+          <label style="margin:0; display:flex; gap:5px; align-items:center; color:var(--text)">
+            <input type="checkbox" value="decision.created" checked /> 对象新决定 decision.created
+          </label>
+          <label style="margin:0; display:flex; gap:5px; align-items:center; color:var(--text)">
+            <input type="checkbox" value="case.closed" /> 冲突案闭合 case.closed
+          </label>
+          <label style="margin:0; display:flex; gap:5px; align-items:center; color:var(--text)">
+            <input type="checkbox" value="cold_segment.generated" /> 冷段生成 cold_segment.generated
+          </label>
+        </div>
+        <label>签名密钥 signing_key（≥16 字符；旧版本保留用于在途批次验签）</label>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="subKey" style="flex:1" placeholder="签名密钥，至少 16 字符" />
+          <button class="ghost" type="button" id="genKey">生成</button>
+        </div>
+        <div style="margin-top:10px;">
+          <button id="subCreateBtn" type="button">登记订阅</button>
+          <button class="ghost" type="button" id="subPumpBtn">立即驱动投递</button>
+        </div>
+      </div>
+
+      <div id="subsList" style="margin-top:12px;" class="muted">加载中…</div>
+    </section>
+
+    <section class="panel" id="detailPanel" hidden>
+      <h2 id="detailTitle">对象</h2>
+      <div class="grid2">
+        <div>
+          <h2 style="margin-top:0">版本图（实线=已到边，红虚线=缺失前驱）</h2>
+          <svg class="graph" id="graphSvg"></svg>
+          <p class="muted" id="suspInfo"></p>
+        </div>
+        <div>
+          <h2 style="margin-top:0">节点 / 当前决定</h2>
+          <div id="detailBody"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>

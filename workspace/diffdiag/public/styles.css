@@ -1,0 +1,77 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #10141a;
+  color: #d7dee8;
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 18px;
+  background: #171d26;
+  border-bottom: 1px solid #2a3342;
+}
+h1 { font-size: 18px; margin: 0; }
+h1 small { color: #7f8ca0; font-weight: normal; }
+h2 { font-size: 15px; }
+h3 { font-size: 13px; color: #9fb0c8; margin: 0 0 8px; }
+h4 { font-size: 12px; color: #9fb0c8; margin: 10px 0 4px; }
+section { padding: 14px 18px; max-width: 1100px; }
+.card {
+  background: #171d26;
+  border: 1px solid #2a3342;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+.hidden { display: none !important; }
+.hint { color: #7f8ca0; font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.cols { display: flex; gap: 18px; }
+.cols > div { flex: 1; min-width: 0; }
+input, textarea, select {
+  background: #0d1117;
+  color: #d7dee8;
+  border: 1px solid #2a3342;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+textarea { width: 100%; }
+button {
+  background: #24314a;
+  color: #d7dee8;
+  border: 1px solid #33415c;
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+button:disabled { opacity: 0.4; cursor: default; }
+button:hover:not(:disabled) { background: #2d3d5c; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #232b38; }
+th { color: #7f8ca0; font-weight: normal; }
+#error-box {
+  margin: 12px 18px 0;
+  padding: 8px 12px;
+  background: #3a1d24;
+  border: 1px solid #6e2f3c;
+  border-radius: 6px;
+  color: #f0b9c2;
+  max-width: 1100px;
+}
+pre {
+  background: #0d1117;
+  border: 1px solid #232b38;
+  border-radius: 6px;
+  padding: 8px;
+  overflow: auto;
+  font-size: 12px;
+}
+ul.tree, #diag-affected, #diag-evidence { list-style: none; padding-left: 6px; }
+ul.tree li, #diag-affected li, #diag-evidence li { padding: 1px 0; }
+ul.tree li.affected { color: #f0c674; font-weight: bold; }
+#session { display: flex; gap: 8px; align-items: center; }

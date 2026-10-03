@@ -1,0 +1,16 @@
+{
+  "name": "converge",
+  "version": "1.0.0",
+  "description": "Multi-site de-identified change convergence service with persisted directed version graph",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "verify": "node scripts/verify.mjs",
+    "verify:archive": "node scripts/verify-archive.mjs",
+    "verify:subscriptions": "node scripts/verify-subscriptions.mjs"
+  }
+}

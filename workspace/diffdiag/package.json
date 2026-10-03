@@ -1,0 +1,15 @@
+{
+  "name": "diffdiag",
+  "version": "1.0.0",
+  "description": "Causal divergence diagnostician for converge de-identified decision receipts",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "verify": "node scripts/verify.mjs",
+    "verify:integration": "node scripts/verify-integration.mjs"
+  }
+}

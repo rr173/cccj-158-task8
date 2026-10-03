@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diffdiag · 因果差异诊断台</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header>
+  <h1>diffdiag <small>converge 因果差异诊断台</small></h1>
+  <div id="session">
+    <span id="who"></span>
+    <button id="refresh" class="hidden">刷新</button>
+    <button id="logout" class="hidden">退出</button>
+  </div>
+</header>
+
+<div id="error-box" class="hidden"></div>
+
+<section id="login">
+  <h2>登录</h2>
+  <p class="hint">凭据仅保存在当前标签页 sessionStorage；刷新后所有状态都从服务端重新读取。</p>
+  <input id="token" type="password" placeholder="访问令牌" autocomplete="off">
+  <button id="login-btn">登录</button>
+</section>
+
+<!-- 运维者：算法版本与任务取消 -->
+<section id="operator" class="role hidden">
+  <h2>运维者视图</h2>
+
+  <div class="card">
+    <h3>比较算法版本</h3>
+    <table id="algo-table"><thead><tr><th>版本</th><th>状态</th><th>说明</th><th></th></tr></thead><tbody></tbody></table>
+    <div class="row">
+      <input id="algo-version" placeholder="新版本名（须为实现内建版本）">
+      <input id="algo-desc" placeholder="说明（可选）">
+      <button id="algo-register">登记版本</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>比较任务 <button id="worker-run" title="驱动 worker 处理队列">运行 worker</button></h3>
+    <table id="op-task-table"><thead><tr>
+      <th>任务键</th><th>状态</th><th>阶段</th><th>算法</th><th>水位 L/R</th><th>证明摘要</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card">
+    <h3>收据包入库</h3>
+    <textarea id="package-json" rows="5" placeholder='{"group":"...","object_key":"...","receipts":[...]}'></textarea>
+    <div class="row"><button id="package-submit">校验并入库</button><span id="package-result"></span></div>
+  </div>
+
+  <div class="card">
+    <h3>对象与水位</h3>
+    <table id="op-object-table"><thead><tr><th>组</th><th>对象键</th><th>收据数</th><th>链首序号</th><th>水位</th></tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<!-- 分析者：选择两组对象，查看差异树与脱敏证据 -->
+<section id="analyst" class="role hidden">
+  <h2>分析者视图</h2>
+
+  <div class="card">
+    <h3>新建比较</h3>
+    <div class="row">
+      <label>左组 <select id="left-group"></select></label>
+      <label>右组 <select id="right-group"></select></label>
+      <input id="task-key" placeholder="任务键（幂等键）">
+      <button id="compare-create">创建比较</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>任务列表</h3>
+    <table id="an-task-table"><thead><tr>
+      <th>任务键</th><th>状态</th><th>阶段</th><th>算法</th><th>水位 L/R</th><th>证明摘要</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card" id="diagnostic-card">
+    <h3>差异树与脱敏证据 <span id="diag-task"></span></h3>
+    <div id="diag-empty" class="hint">选择已完成的任务查看诊断。</div>
+    <div id="diag-body" class="hidden">
+      <div id="diag-meta"></div>
+      <div class="cols">
+        <div><h4>左骨架</h4><ul id="skel-left" class="tree"></ul></div>
+        <div><h4>右骨架</h4><ul id="skel-right" class="tree"></ul></div>
+      </div>
+      <h4>第一处分歧</h4>
+      <pre id="diag-divergence"></pre>
+      <h4>受影响下游节点</h4>
+      <ul id="diag-affected"></ul>
+      <h4>解释证据（哈希链，脱敏）</h4>
+      <ul id="diag-evidence"></ul>
+    </div>
+  </div>
+</section>
+
+<!-- 只读观察者：只能验证证明 -->
+<section id="observer" class="role hidden">
+  <h2>观察者视图（只读）</h2>
+
+  <div class="card">
+    <h3>验证证明</h3>
+    <div class="row">
+      <input id="verify-key" placeholder="任务键">
+      <button id="verify-btn">验证</button>
+    </div>
+    <pre id="verify-result"></pre>
+  </div>
+
+  <div class="card">
+    <h3>证明摘要</h3>
+    <table id="proof-table"><thead><tr>
+      <th>任务键</th><th>状态</th><th>算法</th><th>水位 L/R</th><th>证明摘要</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>

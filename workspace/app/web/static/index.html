@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>影像安全工作台 · 去标识与受控回链</title>
+<link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+<header id="topbar" hidden>
+  <div class="brand">影像安全工作台</div>
+  <nav id="tabs"></nav>
+  <div class="session">
+    <span id="session-badge"></span>
+    <button id="btn-logout" class="btn btn-ghost" type="button">退出并清除本页</button>
+  </div>
+</header>
+
+<main id="view"></main>
+
+<!-- 登录 -->
+<dialog id="login-dialog">
+  <form id="login-form" method="dialog" class="card login-card">
+    <h2>登录工作台</h2>
+    <p class="hint">
+      HTTP Basic 凭据仅保存在<strong>当前标签页会话</strong>（sessionStorage）。
+      临床医生与隐私官必须使用<strong>各自独立的浏览器会话/标签页</strong>依次授权，
+      不得在同一会话中切换角色。
+    </p>
+    <label>用户名
+      <input id="login-user" name="username" autocomplete="username" required spellcheck="false">
+    </label>
+    <label>密码
+      <input id="login-pass" name="password" type="password"
+             autocomplete="current-password" required>
+    </label>
+    <p id="login-error" class="error" hidden></p>
+    <button class="btn btn-primary" type="submit">登录</button>
+    <p class="hint">演示账户：tech / clinician / officer / admin（密码见 README）。</p>
+  </form>
+</dialog>
+
+<!-- 通用信息弹层：内容仅来自服务端响应，关闭即清空 -->
+<dialog id="modal"></dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>
