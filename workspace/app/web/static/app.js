@@ -764,8 +764,218 @@ function collectAuditFilters() {
 }
 
 // ---------- 标签页注册（顺序即角色视图顺序） ----------
+const DIAG_JOB_PILL = { waiting: "info", running: "warn", done: "ok",
+  failed: "bad", cancelled: "bad", wait_expired: "bad" };
+
+// =========================================================
+// 诊断作业 · 运维者（团队队列 / 额度占用 / 轮转顺序 / 权重 / 暂停）
+// =========================================================
+
+const DiagOperator = {
+  id: "diag-operator",
+  label: "诊断调度（运维）",
+  roles: ["operator", "admin"],
+  async load() {
+    const [rot, jobs, usage] = await Promise.all([
+      apiGet("/api/diag/rotation"),
+      apiGet("/api/diag/jobs"),
+      apiGet("/api/diag/usage").catch(() => null),
+    ]);
+    const counts = jobs.reduce((a, j) => (a[j.status] = (a[j.status] || 0) + 1, a), {});
+    $("#view").innerHTML = `
+      <h2>诊断多租户调度 <span class="count">累计领取 ${esc(rot.claim_count)}</span></h2>
+      <div class="card">
+        <div class="row">
+          <span class="hint">下一个被领取团队：</span>
+          ${rot.next_team_id ? `<strong class="mono">${esc(rot.next_team_id)}</strong>`
+            : '<span class="hint">当前无可领取作业</span>'}
+          <span class="spacer"></span>
+          <button class="btn btn-primary" data-act="diag-run">领取并执行 1 个</button>
+          <button class="btn btn-sm" data-act="diag-run-claim">只领取(核对轮转)</button>
+          <button class="btn btn-sm" data-act="diag-sweep">清扫超等待上限</button>
+        </div>
+        <div class="row" style="margin-top:6px;">
+          ${Object.entries(counts).map(([k, v]) =>
+            `<span class="pill ${DIAG_JOB_PILL[k] || ""}">${esc(k)} × ${v}</span>`).join("")}
+        </div>
+      </div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <table>
+          <thead><tr><th>轮转序</th><th>团队</th><th>权重</th><th>并发额度</th>
+            <th>运行占用</th><th>等待占用</th><th>WRR信用</th><th>状态</th><th>操作</th>
+          </tr></thead>
+          <tbody>${rot.teams.map((t, i) => `
+            <tr${rot.next_team_id === t.id ? ' class="hl"' : ""}>
+              <td>${i + 1}${rot.next_team_id === t.id ? " ▶" : ""}</td>
+              <td><strong>${esc(t.name)}</strong>
+                <div class="mono muted">${esc(t.id)}</div></td>
+              <td>
+                <input type="number" min="1" value="${esc(t.weight)}"
+                       style="width:60px" data-role="weight-${esc(t.id)}">
+                <button class="btn btn-sm" data-act="diag-weight"
+                        data-tid="${esc(t.id)}">改权重</button></td>
+              <td>
+                <input type="number" min="1" value="${esc(t.concurrency_quota)}"
+                       style="width:60px" data-role="quota-${esc(t.id)}">
+                <button class="btn btn-sm" data-act="diag-quota"
+                        data-tid="${esc(t.id)}">改额度</button></td>
+              <td>${esc(t.running_cost)} / ${esc(t.concurrency_quota)}
+                <div class="hint">运行 ${esc(t.running_jobs)} 个</div></td>
+              <td>${esc(t.waiting_cost)}
+                <div class="hint">等待 ${esc(t.waiting_jobs)} 个 · 上限 ${esc(t.wait_cap)}</div></td>
+              <td class="mono">${esc(t.credit)}</td>
+              <td>${t.paused ? '<span class="pill bad">已暂停（保留队列位置）</span>'
+                : (t.eligible_now ? '<span class="pill ok">轮转中</span>'
+                  : '<span class="pill">暂无可领取</span>')}</td>
+              <td class="nowrap">
+                ${t.paused
+                  ? `<button class="btn btn-sm btn-primary" data-act="diag-resume"
+                       data-tid="${esc(t.id)}">恢复参与轮转</button>`
+                  : `<button class="btn btn-sm btn-danger" data-act="diag-pause"
+                       data-tid="${esc(t.id)}">暂停</button>`}</td>
+            </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <h3 style="padding:12px 12px 0;">团队作业队列（全部团队）</h3>
+        ${diagJobsTable(jobs, false)}
+      </div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <h3 style="padding:12px 12px 0;">用量明细 · 周期 ${esc(usage ? usage.period : "")}</h3>
+        ${usage ? diagUsageDetailTable(usage) : '<p class="hint" style="padding:0 12px;">暂无入账</p>'}
+      </div>`;
+  },
+};
+
+function diagJobsTable(jobs, mine) {
+  return `<table>
+    <thead><tr><th>作业</th>${mine ? "<th>团队</th>" : ""}<th>状态</th>
+      <th>预估/结算成本</th><th>提交者</th><th>创建</th><th>租约/错误</th><th>操作</th>
+    </tr></thead>
+    <tbody>${jobs.length ? jobs.map((j) => `
+      <tr>
+        <td class="mono">${esc(j.id)}<div class="hint">${esc(j.request_token)}</div></td>
+        ${mine ? `<td class="mono">${esc(j.team_id)}</td>` : ""}
+        <td>${pill(j.status, DIAG_JOB_PILL)}</td>
+        <td>${esc(j.estimated_cost)}${j.billed_at ? " ✓已结算" : ""}</td>
+        ${mine ? "" : `<td class="mono">${esc(j.submitted_by)}</td>`}
+        <td class="nowrap">${fmtTime(j.created_at)}</td>
+        <td class="mono" style="max-width:220px">${j.status === "running"
+          ? "租约至 " + fmtTime(j.lease_until) : esc(j.last_error || "")}</td>
+        <td class="nowrap">
+          ${j.status === "done" ? `<button class="btn btn-sm" data-act="diag-result"
+              data-jid="${esc(j.id)}">查看封存结果</button>` : ""}
+          ${j.status === "waiting" && mine ? `<button class="btn btn-sm btn-danger"
+              data-act="diag-cancel" data-jid="${esc(j.id)}">取消并返还预留</button>` : ""}
+        </td>
+      </tr>`).join("") : emptyRow(7, "暂无诊断作业")}
+    </tbody></table>`;
+}
+
+function diagUsageDetailTable(usage) {
+  const totals = (usage.totals || []).map((t) =>
+    `<span class="pill info">${esc(t.team_id)}: ${esc(t.jobs)} 笔 / ${esc(t.cost)} 成本</span>`)
+    .join(" ");
+  return `
+    <div class="row" style="padding:8px 12px;">${totals || '<span class="hint">本周期无入账</span>'}</div>
+    <table>
+      <thead><tr><th>周期</th><th>团队</th><th>作业</th><th>成本</th>
+        <th>提交者</th><th>结算时间</th></tr></thead>
+      <tbody>${usage.entries.length ? usage.entries.map((e) => `
+        <tr><td>${esc(e.period)}</td><td class="mono">${esc(e.team_id)}</td>
+          <td class="mono">${esc(e.job_id)}</td><td>${esc(e.cost)}</td>
+          <td class="mono">${esc(e.submitted_by)}</td><td>${fmtTime(e.billed_at)}</td>
+        </tr>`).join("") : emptyRow(6, "本周期暂无入账记录")}
+      </tbody></table>`;
+}
+
+// =========================================================
+// 诊断作业 · 分析者（只看本团队本人，提交/取消自己的作业）
+// =========================================================
+
+const DiagAnalyst = {
+  id: "diag-analyst",
+  label: "我的诊断作业",
+  roles: ["analyst"],
+  async load() {
+    const [mine, teams] = await Promise.all([
+      apiGet("/api/diag/mine"),
+      apiGet("/api/diag/rotation").catch(() => null),
+    ]);
+    let myTeam = null;
+    if (teams) myTeam = teams.teams.find((t) => mine.some((j) => j.team_id === t.id));
+    const counts = mine.reduce((a, j) => (a[j.status] = (a[j.status] || 0) + 1, a), {});
+    $("#view").innerHTML = `
+      <h2>提交诊断作业 <span class="count">仅本团队 · 本人可见</span></h2>
+      <div class="banner info">受理时服务端<strong>冻结所属团队与预估成本</strong>。
+        令牌+正文完全相同会指向原作业（幂等）；<strong>令牌相同而正文变化会被拒绝（409）</strong>。
+        取消等待作业立即返还预留；运行中的作业不可取消。</div>
+      <div class="card">
+        <div class="toolbar">
+          <label>请求令牌 <input id="dg-token" placeholder="客户端幂等令牌（唯一）"></label>
+          <label>分析项 <input id="dg-analyses" placeholder="lung,nodule（逗号分隔）"></label>
+          <label>预估成本 <input id="dg-cost" type="number" min="1" value="1" style="width:90px"></label>
+          <label>备注 <input id="dg-note"></label>
+          <button class="btn btn-primary" data-act="diag-submit">受理作业</button>
+        </div>
+        ${myTeam ? `<p class="hint">本团队额度：运行 ${esc(myTeam.running_cost)}/${esc(myTeam.concurrency_quota)}
+          （等待 ${esc(myTeam.waiting_jobs)}，上限 ${esc(myTeam.wait_cap)}）
+          ${myTeam.paused ? "· <strong>团队已暂停，作业保留队列位置，恢复后继续轮转</strong>" : ""}</p>`
+        : ""}
+      </div>
+      <h3>我的作业 <span class="count">${mine.length}</span>
+        ${Object.entries(counts).map(([k, v]) =>
+          `<span class="pill ${DIAG_JOB_PILL[k] || ""}">${esc(k)} × ${v}</span>`).join("")}
+      </h3>
+      <div class="card" style="padding:0;overflow:auto;">
+        ${diagJobsTable(mine, true)}
+      </div>`;
+  },
+};
+
+// =========================================================
+// 诊断作业 · 观察者（仅脱敏用量摘要）
+// =========================================================
+
+const DiagObserver = {
+  id: "diag-observer",
+  label: "用量摘要（脱敏核验）",
+  roles: ["observer"],
+  async load() {
+    const period = $("#dg-period")?.value || "";
+    const s = await apiGet("/api/diag/usage/summary" + (period ? "?period=" + period : ""));
+    $("#view").innerHTML = `
+      <h2>脱敏用量摘要 · 周期 ${esc(s.period)}</h2>
+      <div class="banner info">仅提供<strong>按团队-周期聚合的数字与稳定别名</strong>：
+        不含团队 id/名称、作业 id、提交者或任何诊断内容。别名同周期稳定可核对，
+        跨周期不可链接。</div>
+      <div class="card">
+        <div class="row">
+          <label>周期 <input id="dg-period" placeholder="YYYY-MM"
+            value="${esc(s.period)}" style="width:120px"></label>
+          <button class="btn btn-primary" data-act="diag-summary-reload">按周期核验</button>
+          <span class="spacer"></span>
+          <span class="pill info">作业合计 ${esc(s.total_jobs)}</span>
+          <span class="pill info">成本合计 ${esc(s.total_cost)}</span>
+        </div>
+      </div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <table>
+          <thead><tr><th>团队（脱敏别名）</th><th>作业数</th><th>成本合计</th></tr></thead>
+          <tbody>${s.teams.length ? s.teams.map((t) => `
+            <tr><td class="mono">${esc(t.team_alias)}</td>
+              <td>${esc(t.jobs)}</td><td>${esc(t.cost)}</td></tr>`).join("")
+            : emptyRow(3, "该周期无用量记录")}
+          </tbody>
+        </table>
+      </div>`;
+  },
+};
+
 const TAB_DEFS = [TechQueue, TechQC, TechStudies, ClinRelink,
-  OfficerPending, OfficerOversight, AuditView];
+  OfficerPending, OfficerOversight, DiagOperator, DiagAnalyst, DiagObserver,
+  AuditView];
 const TABS = Object.fromEntries(TAB_DEFS.map((t) => [t.id, t]));
 
 function visibleTabs() {
@@ -963,6 +1173,100 @@ document.addEventListener("click", async (e) => {
         await openRelinkDetail(btn.dataset.rid);
         break;
       case "oversight-reload":
+        await TABS[S.tab].load();
+        break;
+      // ---- 诊断多租户 ----
+      case "diag-run": {
+        await withBtn(btn, "diag-run", async () => {
+          const r = await apiPost("/api/diag/scheduler/run?cycles=1", {});
+          toast(r.processed.length ? "已领取并执行：" + r.processed[0].job_id
+            : "当前无可领取作业", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-run-claim": {
+        await withBtn(btn, "diag-run-claim", async () => {
+          const r = await apiPost("/api/diag/scheduler/run?cycles=1&claim_only=true", {});
+          toast(r.processed.length ? "已领取（不执行）：" + r.processed[0].job_id
+            : "当前无可领取作业", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-sweep": {
+        await withBtn(btn, "diag-sweep", async () => {
+          const r = await apiPost("/api/diag/sweep", {});
+          toast("超等待上限终结：" + r.wait_expired.length + " 个", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-weight":
+      case "diag-quota": {
+        const tid = btn.dataset.tid;
+        const role = act === "diag-weight" ? "weight" : "quota";
+        const val = parseInt(card.querySelector(`[data-role="${role}-${tid}"]`).value, 10);
+        if (!val || val < 1) { toast("请输入不小于 1 的正整数"); break; }
+        await withBtn(btn, act + ":" + tid, async () => {
+          await apiPost(`/api/diag/teams/${tid}/${role === "quota" ? "quota" : "weight"}`,
+            role === "quota" ? { concurrency_quota: val } : { weight: val });
+          toast("已调整；只作用于之后的领取（运行槽不强制转移）", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-pause":
+      case "diag-resume": {
+        const tid = btn.dataset.tid;
+        const paused = act === "diag-pause";
+        await withBtn(btn, act + ":" + tid, async () => {
+          await apiPost(`/api/diag/teams/${tid}/pause`, { paused });
+          toast(paused ? "已暂停：队列位置保留，恢复后继续轮转"
+            : "已恢复：继续参与加权轮转", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-submit": {
+        const token = $("#dg-token").value.trim();
+        if (!token) { toast("请填写请求令牌"); break; }
+        const analyses = $("#dg-analyses").value.split(",").map((s) => s.trim()).filter(Boolean);
+        const body = {
+          request_token: token,
+          estimated_cost: parseInt($("#dg-cost").value, 10) || 1,
+        };
+        if (analyses.length) body.analyses = analyses;
+        const note = $("#dg-note").value.trim();
+        if (note) body.note = note;
+        await withBtn(btn, "diag-submit:" + token, async () => {
+          const r = await apiPost("/api/diag/jobs", body);
+          toast(r.idempotent_replay ? "幂等：令牌+正文指向原作业 " + r.id
+            : "已受理（团队与成本已冻结）：" + r.id, "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-cancel": {
+        const jid = btn.dataset.jid;
+        await withBtn(btn, "diag-cancel:" + jid, async () => {
+          await apiPost(`/api/diag/jobs/${jid}/cancel`, {});
+          toast("已取消等待作业并立即返还预留", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-result": {
+        const r = await apiGet(`/api/diag/jobs/${btn.dataset.jid}/result`);
+        openModal(`
+          <h2>封存结果 <span class="hint">${esc(r.job_id)}</span></h2>
+          <div class="banner">结果已封存（WORM 信封加密）；重复查看不产生新计算或计费。
+            摘要 sha256：<code class="mono">${esc(r.result_sha256)}</code></div>
+          <pre>${esc(JSON.stringify(r.result, null, 2))}</pre>
+          <div class="dlg-actions"><button class="btn" data-act="modal-close">关闭</button></div>`);
+        break;
+      }
+      case "diag-summary-reload":
         await TABS[S.tab].load();
         break;
       // ---- 审计 ----

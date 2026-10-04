@@ -12,7 +12,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import store
-from app.services import queue, reidentify
+from app.services import diagnostics as diag_svc, queue, reidentify
 
 
 def main() -> int:
@@ -23,17 +23,24 @@ def main() -> int:
     args = ap.parse_args()
 
     store.init_db()
+    diag_svc.ensure_defaults("worker")
     done = 0
     while True:
+        # 既有去标识派生队列与诊断多租户队列轮流各取一个
         result = queue.run_once()
+        source = "derive"
         if result is None:
-            # 空闲时顺带清扫过期回链授权
+            result = diag_svc.run_once("worker-loop")
+            source = "diag"
+        if result is None:
+            # 空闲时顺带清扫过期回链授权与超等待上限的诊断作业
             reidentify.sweep_expired("worker-sweep")
+            diag_svc.sweep_wait_expired("worker-sweep")
             if args.once or (args.cycles and done >= args.cycles):
                 break
             time.sleep(args.poll)
             continue
-        print(f"[{time.strftime('%H:%M:%S')}] {result}", flush=True)
+        print(f"[{time.strftime('%H:%M:%S')}] {source}: {result}", flush=True)
         done += 1
         if args.once or (args.cycles and done >= args.cycles):
             break

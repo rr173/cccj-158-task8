@@ -192,6 +192,67 @@ CREATE TABLE IF NOT EXISTS audit_snapshots (
     records_sha256 TEXT NOT NULL,
     frozen_result_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS diag_teams (
+    -- 诊断作业租户：独立并发额度（cost 单位）、等待上限（作业数）、权重
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    concurrency_quota INTEGER NOT NULL,
+    wait_cap INTEGER NOT NULL,
+    weight INTEGER NOT NULL,
+    paused INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT, created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS diag_jobs (
+    -- 诊断作业。冻结列在受理时写入后永不变更（team/预估成本/正文指纹）。
+    -- request_token 唯一：令牌相同正文相同→幂等返回原作业；令牌相同正文变化→拒绝。
+    id TEXT PRIMARY KEY,
+    team_id TEXT NOT NULL REFERENCES diag_teams(id),
+    submitted_by TEXT NOT NULL,
+    request_token TEXT NOT NULL UNIQUE,
+    body_cas_id TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    parameters_json TEXT NOT NULL DEFAULT '{}',
+    estimated_cost INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'waiting',
+    -- waiting/running/done/failed/cancelled/wait_expired（后四者为终态）
+    wait_cap INTEGER NOT NULL,
+    wait_deadline TEXT,
+    result_cas_id TEXT,
+    result_sha256 TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    lease_owner TEXT, lease_until TEXT,
+    available_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    sealed_at TEXT,
+    billed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_diag_jobs_pick
+    ON diag_jobs(status, team_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_diag_jobs_team ON diag_jobs(team_id, status);
+CREATE TABLE IF NOT EXISTS diag_scheduler (
+    -- 加权轮转单例状态：credits_json 为平滑加权轮转各团队当前信用，
+    -- 持久化使领取顺序跨进程确定；暂停/恢复/降额都不清空信用（保留轮转位置）。
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    claim_count INTEGER NOT NULL DEFAULT 0,
+    cursor_team_id TEXT,
+    credits_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS diag_team_usage (
+    -- 用量账本：按团队+结算周期（UTC YYYY-MM）累加；
+    -- (period, team_id, job_id) 唯一，同一作业成功结算永远只入账一次。
+    period TEXT NOT NULL,
+    team_id TEXT NOT NULL REFERENCES diag_teams(id),
+    job_id TEXT NOT NULL REFERENCES diag_jobs(id),
+    cost INTEGER NOT NULL,
+    billed_at TEXT NOT NULL,
+    PRIMARY KEY (period, team_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_diag_usage_team
+    ON diag_team_usage(team_id, period);
 """
 
 

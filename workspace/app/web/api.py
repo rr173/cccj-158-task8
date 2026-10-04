@@ -19,9 +19,10 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from ..core import dicomutil, store
-from ..services import (audit as audit_svc, ingest as ingest_svc,
-                        policies as policies_svc, queue, reidentify,
-                        snapshots as snap_svc, versions as versions_svc)
+from ..services import (audit as audit_svc, diagnostics as diag_svc,
+                        ingest as ingest_svc, policies as policies_svc, queue,
+                        reidentify, snapshots as snap_svc,
+                        versions as versions_svc)
 from .auth import authenticate, require_role
 
 app = FastAPI(title="医学影像去标识化与受控回链平台", version="1.0.0")
@@ -49,6 +50,8 @@ def _startup():
     except store.NotFound:
         policies_svc.register_policy(
             "project-default", dicomutil.default_policy("strict"), "system")
+    # 诊断多租户：默认团队与调度器单例行
+    diag_svc.ensure_defaults("system")
 
 
 @app.get("/health")
@@ -251,6 +254,221 @@ def requeue(body: RequeueBody, user=Depends(require_role("technician"))):
         _conflict(exc)
     except store.NotFound:
         raise HTTPException(404, "job not found")
+
+
+# ---------- 诊断作业：多租户配额与加权轮转 ----------
+
+class DiagSubmitBody(BaseModel):
+    request_token: str = Field(..., description="客户端幂等令牌")
+    analyses: Optional[list[str]] = Field(None, description="分析项（缺省成本=1+项数）")
+    estimated_cost: Optional[int] = Field(None, ge=1, description="显式预估成本（冻结）")
+    study_id: Optional[str] = None
+    note: Optional[str] = None
+    fault_inject: Optional[str] = Field(None, description="execute_error=执行失败")
+
+
+class DiagTeamBody(BaseModel):
+    name: str
+    concurrency_quota: int = Field(..., ge=1)
+    wait_cap: int = Field(..., ge=1)
+    weight: int = Field(..., ge=1)
+
+
+class DiagQuotaBody(BaseModel):
+    concurrency_quota: int = Field(..., ge=1)
+
+
+class DiagWeightBody(BaseModel):
+    weight: int = Field(..., ge=1)
+
+
+class DiagWaitCapBody(BaseModel):
+    wait_cap: int = Field(..., ge=1)
+
+
+class DiagPauseBody(BaseModel):
+    paused: bool
+
+
+def _diag_roles(user: dict) -> tuple[str, ...]:
+    return tuple(user["roles"])
+
+
+@app.get("/api/diag/teams", tags=["diagnostics"])
+def diag_teams(user=Depends(require_role("operator", "admin"))):
+    """团队队列与额度占用（运维视图）。"""
+    return diag_svc.teams_overview()
+
+
+@app.post("/api/diag/teams", tags=["diagnostics"])
+def diag_team_create(body: DiagTeamBody, user=Depends(require_role("admin"))):
+    try:
+        team_id = "team-" + body.name.lower().encode("utf-8").hex()[:16]
+        return diag_svc.create_team(
+            team_id, body.name, concurrency_quota=body.concurrency_quota,
+            wait_cap=body.wait_cap, weight=body.weight, actor=user["username"])
+    except diag_svc.DiagError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/api/diag/teams/{team_id}/quota", tags=["diagnostics"])
+def diag_team_quota(team_id: str, body: DiagQuotaBody,
+                    user=Depends(require_role("operator", "admin"))):
+    """调整并发额度：只作用于之后的领取，不抢占运行槽。"""
+    try:
+        return diag_svc.set_quota(team_id, body.concurrency_quota, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+    except diag_svc.DiagError as exc:
+        _conflict(exc)
+
+
+@app.post("/api/diag/teams/{team_id}/weight", tags=["diagnostics"])
+def diag_team_weight(team_id: str, body: DiagWeightBody,
+                     user=Depends(require_role("operator", "admin"))):
+    try:
+        return diag_svc.set_weight(team_id, body.weight, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+    except diag_svc.DiagError as exc:
+        _conflict(exc)
+
+
+@app.post("/api/diag/teams/{team_id}/wait-cap", tags=["diagnostics"])
+def diag_team_wait_cap(team_id: str, body: DiagWaitCapBody,
+                       user=Depends(require_role("operator", "admin"))):
+    try:
+        return diag_svc.set_wait_cap(team_id, body.wait_cap, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+    except diag_svc.DiagError as exc:
+        _conflict(exc)
+
+
+@app.post("/api/diag/teams/{team_id}/pause", tags=["diagnostics"])
+def diag_team_pause(team_id: str, body: DiagPauseBody,
+                    user=Depends(require_role("operator", "admin"))):
+    """暂停保留队列位置；恢复后继续参与轮转。"""
+    try:
+        return diag_svc.set_paused(team_id, body.paused, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+
+
+@app.get("/api/diag/rotation", tags=["diagnostics"])
+def diag_rotation(user=Depends(require_role("operator", "admin"))):
+    """轮转顺序、各团队本轮份额与运行占用。"""
+    return diag_svc.rotation_view()
+
+
+@app.post("/api/diag/scheduler/run", tags=["diagnostics"])
+def diag_scheduler_run(cycles: int = 1, claim_only: bool = False,
+                       user=Depends(require_role("operator", "admin"))):
+    """驱动调度器：领取并执行诊断作业（仅运维/管理员）。
+
+    claim_only=true 时只领取不执行（作业停留在 running，持有租约），
+    用于运维核对轮转与运行中降额不抢占等语义；worker 常驻进程负责执行。
+    """
+    results = []
+    for _ in range(max(1, min(cycles, 100))):
+        r = diag_svc.run_once(f"operator:{user['username']}", execute=not claim_only)
+        if r is None:
+            break
+        results.append(r)
+    return {"processed": results}
+
+
+@app.post("/api/diag/sweep", tags=["diagnostics"])
+def diag_sweep(user=Depends(require_role("operator", "admin"))):
+    return {"wait_expired": diag_svc.sweep_wait_expired(f"sweep:{user['username']}")}
+
+
+@app.get("/api/diag/jobs", tags=["diagnostics"])
+def diag_jobs(team_id: Optional[str] = None, status: Optional[str] = None,
+              user=Depends(require_role("analyst", "operator", "admin"))):
+    """队列：运维看全部团队；分析者只看本团队且只看本人作业。"""
+    return diag_svc.list_jobs(team_id, status, viewer=user["username"],
+                              roles=_diag_roles(user))
+
+
+@app.post("/api/diag/jobs", tags=["diagnostics"])
+def diag_submit(body: DiagSubmitBody, user=Depends(require_role("analyst"))):
+    """受理：冻结所属团队与预计成本；令牌+正文幂等，令牌同正文变拒绝。"""
+    payload = body.model_dump(exclude_none=True)
+    try:
+        return diag_svc.submit_job(user["username"], payload)
+    except diag_svc.TokenConflict as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "request_token_conflict", "existing_job_id": exc.existing_job_id,
+            "message": str(exc)})
+    except diag_svc.QuotaError as exc:
+        raise HTTPException(status_code=429, detail={
+            "error": "quota_or_wait_cap_rejected", "message": str(exc)})
+    except diag_svc.DiagError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+
+
+@app.get("/api/diag/jobs/{job_id}", tags=["diagnostics"])
+def diag_job_detail(job_id: str,
+                    user=Depends(require_role("analyst", "operator", "admin"))):
+    try:
+        return diag_svc.get_job(job_id, viewer=user["username"],
+                                roles=_diag_roles(user))
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+
+
+@app.get("/api/diag/jobs/{job_id}/result", tags=["diagnostics"])
+def diag_job_result(job_id: str,
+                    user=Depends(require_role("analyst", "admin"))):
+    """已封存结果：仅本人或管理员；重复获取不产生新计算/计费。"""
+    try:
+        return diag_svc.get_job_result(job_id, viewer=user["username"],
+                                       roles=_diag_roles(user))
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+    except diag_svc.JobStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@app.post("/api/diag/jobs/{job_id}/cancel", tags=["diagnostics"])
+def diag_cancel(job_id: str, user=Depends(require_role("analyst"))):
+    """取消等待作业立即返还预留；与领取并发时条件更新决定只有一方推进。"""
+    try:
+        return diag_svc.cancel_job(job_id, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+    except diag_svc.JobStateError as exc:
+        raise HTTPException(status_code=409,
+                            detail={"error": "cancel_lost", "status": exc.status,
+                                    "message": str(exc)})
+
+
+@app.get("/api/diag/usage", tags=["diagnostics"])
+def diag_usage(period: Optional[str] = None, team_id: Optional[str] = None,
+               user=Depends(require_role("operator", "admin"))):
+    """用量明细（按团队/周期）：运维与管理员。"""
+    if period is not None and not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(status_code=400, detail="period must be YYYY-MM")
+    return diag_svc.usage_detail(period, team_id)
+
+
+@app.get("/api/diag/usage/summary", tags=["diagnostics"])
+def diag_usage_summary(period: Optional[str] = None,
+                       user=Depends(require_role("observer", "operator", "admin"))):
+    """脱敏用量摘要：观察者仅能核验聚合数字与稳定别名。"""
+    if period is not None and not re.fullmatch(r"\d{4}-\d{2}", period):
+        raise HTTPException(status_code=400, detail="period must be YYYY-MM")
+    return diag_svc.usage_summary_masked(period)
+
+
+@app.get("/api/diag/mine", tags=["diagnostics"])
+def diag_mine(status: Optional[str] = None, user=Depends(require_role("analyst"))):
+    """分析者工作台：本团队、本人作业。"""
+    return diag_svc.list_jobs(None, status, viewer=user["username"],
+                              roles=_diag_roles(user))
 
 
 # ---------- 质检界面 ----------

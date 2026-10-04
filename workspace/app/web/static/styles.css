@@ -120,3 +120,5 @@ dl.kv dd { margin: 0; word-break: break-all; }
 .nowrap { white-space: nowrap; }
 .spacer { flex: 1; }
 .count { color: var(--muted); font-size: 12px; margin-left: 8px; }
+tr.hl { background: rgba(64, 158, 255, .08); }
+.toolbar input[type="number"] { min-width: 80px; }

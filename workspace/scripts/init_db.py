@@ -5,7 +5,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import dicomutil, store
-from app.services import policies as policies_svc
+from app.services import diagnostics as diag_svc, policies as policies_svc
 
 
 def main() -> None:
@@ -17,6 +17,9 @@ def main() -> None:
         pol = policies_svc.register_policy(
             "project-default", dicomutil.default_policy("strict"), "system")
         print(f"seeded project-default v{pol['version']} ({pol['id']})")
+    diag_svc.ensure_defaults("system")
+    print("seeded diagnostic teams:",
+          ", ".join(t[0] for t in diag_svc.DEFAULT_TEAMS))
     print(f"data home: {os.environ.get('MEDDEID_HOME', './data')}")
 
 
