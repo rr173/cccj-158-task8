@@ -192,6 +192,63 @@ CREATE TABLE IF NOT EXISTS audit_snapshots (
     records_sha256 TEXT NOT NULL,
     frozen_result_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS diagnostic_teams (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    code TEXT NOT NULL UNIQUE,
+    concurrency_limit INTEGER NOT NULL CHECK(concurrency_limit>=0),
+    wait_limit INTEGER NOT NULL CHECK(wait_limit>=0),
+    weight INTEGER NOT NULL CHECK(weight>0),
+    paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1)),
+    rr_credits INTEGER NOT NULL,
+    members_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS diagnostic_jobs (
+    id TEXT PRIMARY KEY,
+    seq INTEGER NOT NULL UNIQUE,
+    team_id TEXT NOT NULL REFERENCES diagnostic_teams(id),
+    requester TEXT NOT NULL,
+    request_token TEXT NOT NULL,
+    body_json TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    estimated_cost INTEGER NOT NULL CHECK(estimated_cost>0),
+    actual_cost INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    lease_owner TEXT,
+    lease_until TEXT,
+    available_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(team_id, request_token)
+);
+CREATE INDEX IF NOT EXISTS idx_diag_jobs_pick
+ON diagnostic_jobs(team_id,status,available_at,seq);
+CREATE TABLE IF NOT EXISTS diagnostic_results (
+    job_id TEXT PRIMARY KEY REFERENCES diagnostic_jobs(id),
+    result_cas_id TEXT NOT NULL,
+    result_sha256 TEXT NOT NULL,
+    actual_cost INTEGER NOT NULL CHECK(actual_cost>0),
+    sealed_by TEXT NOT NULL,
+    sealed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS diagnostic_ledger (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL REFERENCES diagnostic_jobs(id),
+    team_id TEXT NOT NULL REFERENCES diagnostic_teams(id),
+    period TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(job_id, event_type)
+);
+CREATE INDEX IF NOT EXISTS idx_diag_ledger_team_period
+ON diagnostic_ledger(team_id,period,event_type);
 """
 
 
@@ -199,6 +256,14 @@ def init_db(reset: bool = False) -> None:
     config.ensure_dirs()
     conn = get_conn(reset=reset)
     conn.executescript(SCHEMA)
+    _migrate(conn)
+
+
+def _migrate(conn) -> None:
+    """旧库增量补列：新表由 SCHEMA 创建；绝不改写已有业务数据。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(diagnostic_jobs)")}
+    if cols and "actual_cost" not in cols:
+        conn.execute("ALTER TABLE diagnostic_jobs ADD COLUMN actual_cost INTEGER")
 
 
 # ---------- 内容寻址存储 ----------

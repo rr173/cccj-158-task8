@@ -24,6 +24,10 @@ USERS = {
     "clinician": ("clinician-pw-123", ["clinician"]),
     "officer":   ("officer-pw-123",   ["officer"]),
     "admin":     ("admin-pw-123",     ["admin"]),
+    "operator":  ("operator-pw-123",  ["operator"]),
+    "analyst-a": ("analyst-a-pw-123", ["analyst"]),
+    "analyst-b": ("analyst-b-pw-123", ["analyst"]),
+    "observer":  ("observer-pw-123",  ["observer"]),
 }
 
 # 任务重试上限与租约时长

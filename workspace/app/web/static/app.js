@@ -763,8 +763,170 @@ function collectAuditFilters() {
     reid_id: g("f-reid") };
 }
 
+// =========================================================
+// 多租户诊断调度
+// =========================================================
+
+const DIAG_PILL = { queued: "info", retry: "warn", running: "info",
+  done: "ok", failed: "bad", cancelled: "warn" };
+
+const Diagnostics = {
+  id: "diagnostics",
+  label: "诊断多租户队列",
+  roles: ["operator", "analyst", "observer"],
+  async load() {
+    const isOperator = S.me.roles.includes("operator");
+    const isAnalyst = S.me.roles.includes("analyst");
+    const isObserver = S.me.roles.includes("observer") && !isOperator && !isAnalyst;
+    if (isObserver) return this.loadObserver();
+
+    let teams = [], rotation = [], jobs = [], usage = [];
+    try {
+      [teams, rotation, jobs, usage] = await Promise.all([
+        apiGet("/api/diagnostic/teams"),
+        apiGet("/api/diagnostic/rotation"),
+        apiGet("/api/diagnostic/jobs"),
+        apiGet("/api/diagnostic/usage"),
+      ]);
+    } catch (e) { $("#view").innerHTML = errPanel(e); return; }
+
+    const analystTeam = isAnalyst && teams.length === 1 ? teams[0] : null;
+    $("#view").innerHTML = `
+      <h2>诊断作业 · 多租户配额与加权轮转</h2>
+      <div class="banner info">受理时在单事务中冻结团队与预计成本；领取只使用当前额度/权重，
+        已运行槽位不会因降额迁移。调度顺序由服务端按团队代码和轮转票据决定。</div>
+      ${isAnalyst ? analystSubmitCard(analystTeam) : ""}
+      ${isOperator ? `
+      <div class="card">
+        <div class="row">
+          <strong>调度器</strong>
+          <label class="hint">循环 <input id="diag-cycles" type="number" value="1" min="1" max="100" style="width:70px"></label>
+          <label class="hint">租约秒 <input id="diag-lease" type="number" value="600" min="0" style="width:90px"></label>
+          <button class="btn btn-primary" data-act="diag-run">执行轮转</button>
+        </div>
+      </div>` : ""}
+      <div class="card" style="padding:0;overflow:auto;">
+        <h3 style="padding:14px 14px 0;">团队队列、额度占用与轮转顺序</h3>
+        <table>
+          <thead><tr><th>顺序</th><th>团队</th><th>状态/权重</th><th>并发额度占用</th>
+            <th>等待占用</th><th>轮转票据</th><th>用量</th>${isOperator ? "<th>运维调整</th>" : ""}</tr></thead>
+          <tbody>${rotation.length ? rotation.map((t) => `
+            <tr>
+              <td>#${esc(t.rotation_position)}</td>
+              <td><strong>${esc(t.code)}</strong><div class="hint">${esc(t.name)}</div></td>
+              <td>${t.paused ? pill("paused", { paused: "bad" }) : pill("active", { active: "ok" })}
+                  <div class="hint">权重 ${esc(t.weight)}</div></td>
+              <td>${esc(t.running_cost)} / ${esc(t.concurrency_limit)}
+                  <div class="hint">${esc(t.running_jobs)} 个运行中</div></td>
+              <td>${esc(t.waiting_cost)}（${esc(t.waiting_jobs)}/${esc(t.wait_limit)}）</td>
+              <td>${esc(t.rr_credits)}
+                  <div class="hint">下一轮 ${esc(t.next_round_credits)} · ${t.eligible_now ? "可领取" : "等待"}</div></td>
+              <td>${esc(t.usage_cost)} / ${esc(t.billed_jobs)} 单</td>
+              ${isOperator ? operatorTeamControls(t) : ""}
+            </tr>`).join("") : emptyRow(8, "暂无团队")}</tbody>
+        </table>
+      </div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <h3 style="padding:14px 14px 0;">作业队列</h3>
+        <table>
+          <thead><tr><th>作业</th>${isOperator ? "<th>团队</th>" : ""}<th>提交者</th>
+            <th>令牌</th><th>预计成本</th><th>状态</th><th>尝试</th><th>租约/错误</th>
+            <th>操作</th></tr></thead>
+          <tbody>${jobs.length ? jobs.map((j) => `
+            <tr>
+              <td class="mono">${esc(j.id)}</td>
+              ${isOperator ? `<td class="mono">${esc(j.team_id)}</td>` : ""}
+              <td>${esc(j.requester)}</td>
+              <td class="mono">${esc(j.request_token || "（他人作业已脱敏）")}</td>
+              <td>${esc(j.estimated_cost)}</td>
+              <td>${pill(j.status, DIAG_PILL)}</td>
+              <td>${esc(j.attempts)}/${esc(j.max_attempts)}</td>
+              <td class="mono" style="max-width:240px">${esc(j.last_error || "")}
+                <div class="hint">${j.lease_until ? "至 " + fmtTime(j.lease_until) : ""}</div></td>
+              <td class="nowrap">
+                ${j.status === "done" ? `<button class="btn btn-sm" data-act="diag-result" data-jid="${esc(j.id)}">核验结果</button>` : ""}
+                ${isAnalyst && j.requester === S.me.username && ["queued", "retry"].includes(j.status)
+                  ? `<button class="btn btn-sm btn-danger" data-act="diag-cancel" data-jid="${esc(j.id)}">取消并返还</button>` : ""}
+              </td>
+            </tr>`).join("") : emptyRow(9, "暂无诊断作业")}</tbody>
+        </table>
+      </div>
+      ${usageDetails(usage, isOperator)}`;
+  },
+  async loadObserver() {
+    let summary = [];
+    try { summary = await apiGet("/api/diagnostic/usage-summary"); }
+    catch (e) { $("#view").innerHTML = errPanel(e); return; }
+    $("#view").innerHTML = `
+      <h2>脱敏诊断用量摘要</h2>
+      <div class="banner info">观察者仅可核验团队代码与结算周期聚合；不可查看成员、作业、
+        请求令牌、正文或运行队列。</div>
+      <div class="card" style="padding:0;overflow:auto;">
+        <table><thead><tr><th>团队代码</th><th>结算周期</th><th>计费作业</th><th>用量成本</th></tr></thead>
+          <tbody>${summary.length ? summary.flatMap((t) =>
+            (t.periods.length ? t.periods : [{ period: "—", billed_jobs: 0, usage_cost: 0 }])
+              .map((p) => `<tr><td>${esc(t.team_code)}</td><td>${esc(p.period)}</td>
+                <td>${esc(p.billed_jobs)}</td><td>${esc(p.usage_cost)}</td></tr>`)).join("")
+            : emptyRow(4, "暂无用量")}</tbody></table>
+      </div>`;
+  },
+};
+
+function analystSubmitCard(team) {
+  if (!team) return `<div class="banner danger">当前账户未关联唯一团队，无法提交作业。</div>`;
+  return `<div class="card">
+    <h3>提交本团队分析作业</h3>
+    <div class="toolbar">
+      <label>请求令牌 <input id="diag-token" placeholder="幂等令牌" style="min-width:210px"></label>
+      <label>预计成本 <input id="diag-cost" type="number" value="1" min="1" style="width:100px"></label>
+      <label>分析类型 <input id="diag-kind" value="ct"></label>
+      <label>正文 JSON
+        <input id="diag-body" value='{"kind":"ct","case":"demo"}' style="min-width:260px"></label>
+      <input type="hidden" id="diag-team" value="${esc(team.id)}">
+      <button class="btn btn-primary" data-act="diag-submit">提交</button>
+    </div>
+    <p class="hint">相同令牌且正文指纹相同返回原作业；相同令牌正文变化由后端 409 拒绝。</p>
+  </div>`;
+}
+
+function operatorTeamControls(t) {
+  return `<td>
+    <div class="toolbar" style="gap:4px;">
+      <input data-diag-field="limit" data-tid="${esc(t.id)}" type="number" value="${esc(t.concurrency_limit)}" style="width:72px" title="并发额度">
+      <input data-diag-field="wait" data-tid="${esc(t.id)}" type="number" value="${esc(t.wait_limit)}" style="width:72px" title="等待上限">
+      <input data-diag-field="weight" data-tid="${esc(t.id)}" type="number" value="${esc(t.weight)}" style="width:72px" title="权重">
+      <button class="btn btn-sm btn-primary" data-act="diag-team-save" data-tid="${esc(t.id)}">保存</button>
+      <button class="btn btn-sm ${t.paused ? "" : "btn-danger"}" data-act="diag-team-pause"
+              data-tid="${esc(t.id)}" data-paused="${t.paused ? 0 : 1}">
+        ${t.paused ? "恢复" : "暂停"}</button>
+    </div>
+  </td>`;
+}
+
+function usageDetails(usage, isOperator) {
+  return `<div class="card" style="padding:0;overflow:auto;">
+    <h3 style="padding:14px 14px 0;">用量账本（按团队和结算周期累加）</h3>
+    ${usage.map((u) => `
+      <h4 style="padding:0 14px;">${esc(u.team_code)} · ${esc(u.team_name)}</h4>
+      <table>
+        <thead><tr><th>周期</th><th>计费作业</th><th>用量</th><th>当前预留</th><th>已释放</th></tr></thead>
+        <tbody>${(u.periods.length ? u.periods : []).map((p) => `
+          <tr><td>${esc(p.period)}</td><td>${esc(p.billed_jobs)}</td>
+            <td>${esc(p.usage_cost)}</td><td>${esc(p.reserved_cost)}</td>
+            <td>${esc(p.released_cost)}</td></tr>`).join("") || emptyRow(5, "暂无账本记录")}</tbody>
+      </table>
+      ${isOperator ? `<details style="padding:0 14px 12px;"><summary>账本事件明细</summary>
+        <table><thead><tr><th>seq</th><th>作业</th><th>事件</th><th>金额</th><th>操作者</th><th>时间</th></tr></thead>
+          <tbody>${(u.events || []).map((e) => `<tr><td>${esc(e.seq)}</td>
+            <td class="mono">${esc(e.job_id)}</td><td>${esc(e.event_type)}</td>
+            <td>${esc(e.amount)}</td><td>${esc(e.actor)}</td><td>${fmtTime(e.created_at)}</td>
+          </tr>`).join("") || emptyRow(6, "无事件")}</tbody></table></details>` : ""}
+    `).join("")}
+  </div>`;
+}
+
 // ---------- 标签页注册（顺序即角色视图顺序） ----------
-const TAB_DEFS = [TechQueue, TechQC, TechStudies, ClinRelink,
+const TAB_DEFS = [TechQueue, TechQC, TechStudies, Diagnostics, ClinRelink,
   OfficerPending, OfficerOversight, AuditView];
 const TABS = Object.fromEntries(TAB_DEFS.map((t) => [t.id, t]));
 
@@ -964,6 +1126,72 @@ document.addEventListener("click", async (e) => {
         break;
       case "oversight-reload":
         await TABS[S.tab].load();
+        break;
+      // ---- 多租户诊断 ----
+      case "diag-submit": {
+        const token = $("#diag-token").value.trim();
+        if (!token) { toast("请填写请求令牌"); break; }
+        let body = {};
+        try { body = JSON.parse($("#diag-body").value || "{}"); }
+        catch { toast("正文必须是 JSON 对象"); break; }
+        await withBtn(btn, "diag-submit:" + token, async () => {
+          const r = await apiPost("/api/diagnostic/jobs", {
+            team_id: $("#diag-team").value, request_token: token,
+            estimated_cost: parseInt($("#diag-cost").value, 10) || 1, body,
+          });
+          toast(r.idempotent_replay ? "令牌/正文匹配：返回原作业 " + r.id
+            : "已受理并冻结成本 " + r.id, "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-cancel": {
+        const jid = btn.dataset.jid;
+        await withBtn(btn, "diag-cancel:" + jid, async () => {
+          await apiPost(`/api/diagnostic/jobs/${jid}/cancel`, {});
+          toast("等待作业已取消，预留立即返还", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-run": {
+        const cycles = parseInt($("#diag-cycles").value, 10) || 1;
+        const leaseSeconds = parseInt($("#diag-lease").value, 10) || 0;
+        await withBtn(btn, "diag-run", async () => {
+          const r = await apiPost("/api/diagnostic/scheduler/run",
+            { cycles, lease_seconds: leaseSeconds });
+          toast(`轮转执行 ${r.processed.length} 个作业`, "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-team-save": {
+        const tid = btn.dataset.tid;
+        const row = btn.closest("tr");
+        const val = (field) => row.querySelector(`[data-diag-field="${field}"]`).value;
+        await withBtn(btn, "diag-team-save:" + tid, async () => {
+          await apiPost(`/api/diagnostic/teams/${tid}`, {
+            concurrency_limit: parseInt(val("limit"), 10),
+            wait_limit: parseInt(val("wait"), 10),
+            weight: parseInt(val("weight"), 10),
+          });
+          toast("配置已更新；只影响之后的领取", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-team-pause": {
+        const tid = btn.dataset.tid;
+        const paused = btn.dataset.paused === "1";
+        await withBtn(btn, "diag-team-pause:" + tid, async () => {
+          await apiPost(`/api/diagnostic/teams/${tid}`, { paused });
+          toast(paused ? "团队已暂停，队列位置保留" : "团队已恢复，继续参与轮转", "ok");
+        });
+        await TABS[S.tab].load();
+        break;
+      }
+      case "diag-result":
+        await openDiagnosticResult(btn.dataset.jid);
         break;
       // ---- 审计 ----
       case "audit-apply":
@@ -1229,6 +1457,22 @@ async function openRelinkDetail(rid) {
     ${stepBar(r)}
     <h3>原始记录（无身份内容）</h3>
     <pre>${esc(JSON.stringify(r, null, 2))}</pre>
+    <div class="dlg-actions"><button class="btn" data-act="modal-close">关闭</button></div>`);
+}
+
+async function openDiagnosticResult(jid) {
+  const r = await apiGet(`/api/diagnostic/jobs/${jid}/result`);
+  openModal(`
+    <h2>诊断封存结果 <span class="hint mono">${esc(jid)}</span></h2>
+    <div class="banner">结果以 WORM 加密 Blob 封存；重复完成通知只会返回原封存，
+      不会重新计算或重复扣减用量。</div>
+    <dl class="kv">
+      <dt>结果 CAS</dt><dd class="mono">${esc(r.result_cas_id)}</dd>
+      <dt>摘要</dt><dd class="mono">${esc(r.result_sha256)}</dd>
+      <dt>实际成本</dt><dd>${esc(r.actual_cost)}</dd>
+      <dt>封存者/时间</dt><dd>${esc(r.sealed_by)} · ${fmtTime(r.sealed_at)}</dd>
+    </dl>
+    <pre>${esc(JSON.stringify(r.result, null, 2))}</pre>
     <div class="dlg-actions"><button class="btn" data-act="modal-close">关闭</button></div>`);
 }
 

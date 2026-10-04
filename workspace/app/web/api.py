@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from ..core import dicomutil, store
-from ..services import (audit as audit_svc, ingest as ingest_svc,
+from ..services import (audit as audit_svc, diagnostics, ingest as ingest_svc,
                         policies as policies_svc, queue, reidentify,
                         snapshots as snap_svc, versions as versions_svc)
 from .auth import authenticate, require_role
@@ -49,6 +49,7 @@ def _startup():
     except store.NotFound:
         policies_svc.register_policy(
             "project-default", dicomutil.default_policy("strict"), "system")
+    diagnostics.seed_default_teams()
 
 
 @app.get("/health")
@@ -141,6 +142,42 @@ class SnapshotBody(BaseModel):
     study_id: Optional[str] = None
     reid_id: Optional[str] = None
     limit: Optional[int] = Field(None, ge=1, le=100_000)
+
+
+class DiagnosticTeamBody(BaseModel):
+    team_id: Optional[str] = None
+    name: str
+    code: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{1,40}$")
+    concurrency_limit: int = Field(..., ge=1)
+    wait_limit: int = Field(..., ge=0)
+    weight: int = Field(..., ge=1, le=10_000)
+    members: list[str] = []
+
+
+class DiagnosticTeamUpdate(BaseModel):
+    concurrency_limit: Optional[int] = Field(None, ge=0)
+    wait_limit: Optional[int] = Field(None, ge=0, le=100_000)
+    weight: Optional[int] = Field(None, ge=1, le=10_000)
+    paused: Optional[bool] = None
+    members: Optional[list[str]] = None
+
+
+class DiagnosticJobBody(BaseModel):
+    team_id: Optional[str] = None
+    request_token: str = Field(..., min_length=1, max_length=200)
+    estimated_cost: int = Field(..., ge=1, le=1_000_000)
+    max_attempts: int = Field(3, ge=1, le=20)
+    body: dict = Field(default_factory=dict)
+
+
+class DiagnosticRunBody(BaseModel):
+    cycles: int = Field(1, ge=1, le=100)
+    lease_seconds: int = Field(600, ge=0, le=86_400)
+
+
+class DiagnosticResultBody(BaseModel):
+    actual_cost: Optional[int] = Field(None, ge=1, le=1_000_000)
+    result: dict = Field(default_factory=dict)
 
 
 def _conflict(exc: Exception):
@@ -392,6 +429,194 @@ def relink_sweep(user=Depends(require_role("officer", "admin"))):
 def relink_list(status: Optional[str] = None, study_id: Optional[str] = None,
                 user=Depends(require_role("officer", "admin"))):
     return reidentify.list_relinks(status=status, study_id=study_id)
+
+
+# ---------- 多租户诊断调度 ----------
+
+def _diagnostic_conflict(exc: Exception):
+    if isinstance(exc, diagnostics.DiagnosticAuthzError):
+        raise HTTPException(status_code=403, detail=str(exc))
+    raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _analyst_team(user: dict, team_id: Optional[str]) -> str:
+    memberships = [t for t in diagnostics.team_views()
+                   if user["username"] in t.get("members", [])]
+    if team_id is None:
+        if len(memberships) != 1:
+            raise HTTPException(status_code=403,
+                                detail="team_id is required when membership is not unique")
+        return memberships[0]["id"]
+    if not any(t["id"] == team_id for t in memberships):
+        raise HTTPException(status_code=403, detail="not a member of this team")
+    return team_id
+
+
+@app.post("/api/diagnostic/teams", tags=["diagnostics"])
+def create_diagnostic_team(body: DiagnosticTeamBody,
+                           user=Depends(require_role("operator"))):
+    try:
+        return diagnostics.create_team(
+            body.name, body.code, concurrency_limit=body.concurrency_limit,
+            wait_limit=body.wait_limit, weight=body.weight, members=body.members,
+            actor=user["username"], team_id=body.team_id)
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.get("/api/diagnostic/teams", tags=["diagnostics"])
+def diagnostic_teams(user=Depends(require_role("operator", "analyst"))):
+    rows = diagnostics.team_views()
+    if "operator" in user["roles"]:
+        return rows
+    allowed = {t["id"] for t in rows if user["username"] in t.get("members", [])}
+    return [t for t in rows if t["id"] in allowed]
+
+
+@app.get("/api/diagnostic/rotation", tags=["diagnostics"])
+def diagnostic_rotation(user=Depends(require_role("operator", "analyst"))):
+    rows = diagnostics.rotation_view()
+    if "operator" in user["roles"]:
+        return rows
+    allowed = {t["id"] for t in rows if user["username"] in t.get("members", [])}
+    return [t for t in rows if t["id"] in allowed]
+
+
+@app.post("/api/diagnostic/teams/{team_id}", tags=["diagnostics"])
+def update_diagnostic_team(team_id: str, body: DiagnosticTeamUpdate,
+                           user=Depends(require_role("operator"))):
+    try:
+        return diagnostics.update_team(
+            team_id, user["username"], concurrency_limit=body.concurrency_limit,
+            wait_limit=body.wait_limit, weight=body.weight, paused=body.paused,
+            members=body.members)
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.post("/api/diagnostic/jobs", tags=["diagnostics"])
+def submit_diagnostic_job(body: DiagnosticJobBody,
+                          user=Depends(require_role("analyst"))):
+    team_id = _analyst_team(user, body.team_id)
+    try:
+        return diagnostics.submit_job(
+            team_id, user["username"], body.body,
+            request_token=body.request_token, estimated_cost=body.estimated_cost,
+            max_attempts=body.max_attempts)
+    except store.NotFound:
+        raise HTTPException(404, "team not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.get("/api/diagnostic/jobs", tags=["diagnostics"])
+def list_diagnostic_jobs(team_id: Optional[str] = None,
+                         status: Optional[str] = None,
+                         user=Depends(require_role("operator", "analyst"))):
+    if "operator" in user["roles"]:
+        return diagnostics.list_jobs(team_id, status, include_body=False)
+    tid = _analyst_team(user, team_id)
+    return diagnostics.list_jobs(tid, status, include_body=False,
+                                 viewer=user["username"])
+
+
+@app.post("/api/diagnostic/jobs/{job_id}/cancel", tags=["diagnostics"])
+def cancel_diagnostic_job(job_id: str, user=Depends(require_role("analyst"))):
+    try:
+        job = diagnostics.get_job(job_id)
+        _analyst_team(user, job["team_id"])
+        if job["requester"] != user["username"]:
+            raise HTTPException(403, "can only cancel own job")
+        return diagnostics.cancel_job(job_id, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.post("/api/diagnostic/scheduler/claim", tags=["diagnostics"])
+def claim_diagnostic_job(lease_seconds: int = 600,
+                         user=Depends(require_role("operator"))):
+    return diagnostics.claim(user["username"], lease_seconds=lease_seconds)
+
+
+@app.post("/api/diagnostic/scheduler/run", tags=["diagnostics"])
+def run_diagnostic_scheduler(body: DiagnosticRunBody,
+                             user=Depends(require_role("operator"))):
+    results = []
+    for _ in range(body.cycles):
+        result = diagnostics.run_once(user["username"],
+                                      lease_seconds=body.lease_seconds)
+        if result is None:
+            break
+        results.append(result)
+    return {"processed": results}
+
+
+@app.post("/api/diagnostic/jobs/{job_id}/result", tags=["diagnostics"])
+def seal_diagnostic_result(job_id: str, body: DiagnosticResultBody,
+                           user=Depends(require_role("operator"))):
+    try:
+        return diagnostics.record_result(
+            job_id, user["username"], body.result, actual_cost=body.actual_cost)
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.post("/api/diagnostic/jobs/{job_id}/complete", tags=["diagnostics"])
+def complete_diagnostic_job(job_id: str, user=Depends(require_role("operator"))):
+    try:
+        return diagnostics.complete_job(job_id, user["username"])
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.post("/api/diagnostic/jobs/{job_id}/fail", tags=["diagnostics"])
+def fail_diagnostic_job(job_id: str, error: str = "worker failure",
+                        fatal: bool = False, user=Depends(require_role("operator"))):
+    try:
+        return diagnostics.fail_job(job_id, user["username"], error, fatal=fatal)
+    except store.NotFound:
+        raise HTTPException(404, "job not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.get("/api/diagnostic/jobs/{job_id}/result", tags=["diagnostics"])
+def get_diagnostic_result(job_id: str,
+                          user=Depends(require_role("operator", "analyst"))):
+    try:
+        job = diagnostics.get_job(job_id)
+        if "operator" not in user["roles"]:
+            _analyst_team(user, job["team_id"])
+            if job["requester"] != user["username"]:
+                raise HTTPException(403, "can only read own result")
+        return diagnostics.get_result(job_id)
+    except store.NotFound:
+        raise HTTPException(404, "sealed result not found")
+    except diagnostics.DiagnosticError as exc:
+        _diagnostic_conflict(exc)
+
+
+@app.get("/api/diagnostic/usage", tags=["diagnostics"])
+def diagnostic_usage(team_id: Optional[str] = None, period: Optional[str] = None,
+                     user=Depends(require_role("operator", "analyst"))):
+    if "operator" in user["roles"]:
+        return diagnostics.usage(team_id, period, include_events=True)
+    tid = _analyst_team(user, team_id)
+    return diagnostics.usage(tid, period, include_events=True)
+
+
+@app.get("/api/diagnostic/usage-summary", tags=["diagnostics"])
+def diagnostic_usage_summary(period: Optional[str] = None,
+                             user=Depends(require_role("operator", "observer"))):
+    return diagnostics.usage_summary(period)
 
 
 # ---------- 审计导出 ----------

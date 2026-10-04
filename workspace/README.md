@@ -51,6 +51,7 @@ app/
     reidentify.py      双角色授权、纠错、导出、撤销、过期清扫
     audit.py           审计查询与 JSON/CSV 导出
     snapshots.py       验真快照：截止点冻结、幂等、WORM 验真包、逐级验真
+    diagnostics.py     多租户诊断：配额冻结、加权轮转、租约恢复、用量账本
   web/
     auth.py            Basic 认证与四角色控制
     api.py             REST API + 工作台静态资源（/ 与 /ui/*）
@@ -66,8 +67,10 @@ tests/                 35 个端到端/并发/竞态/工作台测试
 ```bash
 pip install -r requirements.txt
 python3 scripts/init_db.py
-# 终端1：worker
+# 终端1：影像 worker
 MEDDEID_HOME=./data python3 scripts/worker.py
+# 可选：多租户诊断 worker
+MEDDEID_HOME=./data python3 scripts/diagnostic_worker.py
 # 终端2：API
 MEDDEID_HOME=./data uvicorn app.web.api:app --port 8088
 ```
@@ -92,6 +95,7 @@ MEDDEID_HOME=./data uvicorn app.web.api:app --port 8088
 - **临床医生**：发起回链并安全保存一次性分片 A → 在本会话粘贴提交步骤 1 → 查看后端真实授权进度；仅在 `armed` 时出现登记纠错与导出入口；导出成功后纠错包只显示一次。
 - **隐私官**：在独立会话中查看待批准队列（仅此处返回分片 B，页面不渲染分片），一键提交步骤 2；监督全部回链、按状态筛选、撤销、清扫过期。
 - **管理员**：审计多条件筛选、哈希链重新校验、JSON/CSV 导出并经受 admin 保护的 blob 接口下载；**冻结验真快照**（按当前筛选与审计序号取不可变截止点，查看范围/链锚/记录数/现场完整性并下载含清单与记录的验真包）；另可只读查看队列/质检、驱动 worker。
+- **运维者 / 分析者 / 观察者**：在“诊断多租户队列”中分别调整团队额度/权重/暂停并驱动调度、提交或取消本人诊断作业、核验脱敏用量摘要。
 - **隐私官**：可在审计页**查询与复核验真快照**（范围、链锚、记录数、完整性结果），但不能创建快照或下载验真包（后端 403 强制）。
 
 > 工作台只**新增**了三个只读恢复接口：`GET /api/me`、`GET /api/relink/mine`、
@@ -106,6 +110,47 @@ MEDDEID_HOME=./data uvicorn app.web.api:app --port 8088
 | clinician | clinician-pw-123 | clinician：发起回链/纠错/导出 |
 | officer | officer-pw-123 | officer：第二授权/撤销 |
 | admin | admin-pw-123 | admin：策略/审计导出 |
+| operator | operator-pw-123 | operator：诊断团队权重/暂停、驱动诊断调度 |
+| analyst-a | analyst-a-pw-123 | analyst：alpha 诊断团队提交/取消自己的作业 |
+| analyst-b | analyst-b-pw-123 | analyst：beta 诊断团队提交/取消自己的作业 |
+| observer | observer-pw-123 | observer：仅核验脱敏诊断用量摘要 |
+
+## 多租户诊断调度
+
+诊断子系统为每个分析团队维护独立的**并发成本额度、等待名额上限和轮转权重**。
+受理请求时在单个 `BEGIN IMMEDIATE` 事务内冻结团队、校验请求令牌并写入预留账本；
+若并发额度不足且等待名额已满，则整体回滚，不留下作业或账本孤立记录。
+
+- **确定性加权轮转**：团队按 `code` 排序，每轮拥有与权重相等的票据；某团队持续突发时，
+  票据用完后必须等其他有等待作业的团队进入下一轮，不能长期独占调度器。
+- **额度调整只向后生效**：降额、加权或暂停不会转移已经运行的执行槽；暂停保留队列位置，
+  恢复后继续参与轮转。
+- **取消/领取竞态**：两者都以条件 `UPDATE ... WHERE status IN ('queued','retry')`
+  判定 rowcount，最多一方推进；取消成功立即冲回预留。
+- **租约与崩溃恢复**：执行进程退出且租约到期后，未封存结果的作业回到原队列位置；
+  已封存 WORM 结果的作业由调度器直接完成，不重新执行正文。
+- **计费去重**：`diagnostic_ledger(job_id,event_type)` 唯一，重复完成通知、失败重试、
+  崩溃恢复只产生一次 `usage`。
+- **角色隔离**：operator 调整团队与驱动调度；analyst 只能查看所属团队并提交/取消本人作业；
+  observer 只能读取团队代码与周期级脱敏用量聚合。
+
+```
+POST   /api/diagnostic/teams                     operator 创建团队
+GET    /api/diagnostic/teams                     operator/analyst 团队队列与额度占用
+GET    /api/diagnostic/rotation                  operator/analyst 轮转顺序与票据
+POST   /api/diagnostic/teams/{id}                operator 调整额度/等待上限/权重/暂停/成员
+POST   /api/diagnostic/jobs                      analyst 提交（request_token + body 幂等）
+GET    /api/diagnostic/jobs                      operator/analyst 查询队列
+POST   /api/diagnostic/jobs/{id}/cancel          analyst 取消自己的等待作业
+POST   /api/diagnostic/scheduler/claim           operator 领取一个作业
+POST   /api/diagnostic/scheduler/run             operator 执行一轮/多轮模拟诊断
+POST   /api/diagnostic/jobs/{id}/result          operator 封存 WORM 结果
+POST   /api/diagnostic/jobs/{id}/complete        operator 按封存结果结算
+POST   /api/diagnostic/jobs/{id}/fail            operator 上报失败/重试
+GET    /api/diagnostic/jobs/{id}/result          operator/作业所有者读取结果
+GET    /api/diagnostic/usage                     operator/analyst 周期账本和明细
+GET    /api/diagnostic/usage-summary             operator/observer 脱敏周期摘要
+```
 
 ## API 速览
 
@@ -195,12 +240,9 @@ curl -s -u clinician:clinician-pw-123 -XPOST $B/api/relink/$RID/export
 
 ```bash
 python3 -m pytest tests/ -q
-# 47 passed —— 覆盖：冻结/幂等、版本不可变、质检隔离、策略升级、
-# 并发修订版本号唯一性、批量领取不重复、租约崩溃接管、重试死信、
-# 双角色授权、错误分片拒绝、导出即失效、撤销/导出竞态五轮、时间窗过期、
-# 网页工作台（服务端状态恢复、独立会话角色隔离、一次性材料、静态资源无数据）、
-# 验真快照（截止点冻结、幂等重放/冲突、空筛选/空库、并发不混入、
-#   角色边界、原链篡改、验真包文件与内容篡改、既有审计接口不回归）
+# 原有 47 项 + 多租户诊断调度专项测试
+# 覆盖：跨团队轮转、单团队突发流量、等待上限、令牌冲突、运行中降额、暂停恢复、
+# 租约过期再领取、完成后崩溃、取消/领取竞态、计费去重和三类角色隔离。
 ```
 
 ## 部署注意（演示实现的边界）

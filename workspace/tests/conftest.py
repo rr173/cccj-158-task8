@@ -19,10 +19,11 @@ def home(tmp_path, monkeypatch):
 
     from app import config
     from app.core import store, dicomutil
-    from app.services import policies as policies_svc, vault as vault_mod
+    from app.services import diagnostics, policies as policies_svc, vault as vault_mod
     store.init_db(reset=True)
     policies_svc.register_policy(
         "project-default", dicomutil.default_policy("strict"), "system")
+    diagnostics.seed_default_teams()
 
     yield tmp_path
 
